@@ -331,6 +331,11 @@ async fn dispatch_request(
     reason = "independent per-direction flags, not a state machine"
 )]
 pub(crate) struct HeaderDeliveryState {
+    /// Whether request header filters already ran. A delayed streamed body
+    /// pipeline runs them before buffering starts and must not run them again
+    /// when the complete body is available.
+    pub(crate) request_filters_executed: bool,
+
     /// Whether response-phase filters already ran at header time.
     pub(crate) response_filters_executed: bool,
 
@@ -524,6 +529,10 @@ pub(crate) struct StreamState {
     /// Effective body-accumulation ceiling in bytes; `None` means unbounded.
     pub(crate) max_body_accumulation: Option<usize>,
 
+    /// Number of streamed request-body messages held while selected-provider
+    /// request-body filters wait for the complete bounded body.
+    pub(crate) pending_selected_request_body_messages: usize,
+
     /// Whether to derive the client address from `x-forwarded-for` when Envoy's
     /// trusted `x-envoy-external-address` header is absent.
     pub(crate) trust_forwarded_for: bool,
@@ -548,6 +557,7 @@ impl Default for StreamState {
             deferred_response_header_mutation: None,
             phase_order: PhaseOrderTracker::default(),
             max_body_accumulation: None,
+            pending_selected_request_body_messages: 0,
             trust_forwarded_for: false,
         }
     }

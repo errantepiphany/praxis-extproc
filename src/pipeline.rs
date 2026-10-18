@@ -55,9 +55,10 @@ pub(crate) async fn run_request_pipeline(
     let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
 
-    let action = execute_request(pipeline, &mut ctx).await?;
-    if let Some(imm) = immediate_from_action(action) {
-        return Ok(vec![response::immediate(imm)]);
+    if let Some(immediate) =
+        execute_request_filters_if_needed(pipeline, &mut ctx, &mut state.header_state.request_filters_executed).await?
+    {
+        return Ok(vec![response::immediate(immediate)]);
     }
 
     let original_len = state.request_body.len();
@@ -70,10 +71,43 @@ pub(crate) async fn run_request_pipeline(
 
     ctx.dehydrate(&mut state.carried_context)?;
 
+    build_request_pipeline_responses(phase, mutation, original_len, end_of_stream, state)
+}
+
+/// Execute request-header filters once while preserving saved route/profile metadata.
+async fn execute_request_filters_if_needed(
+    pipeline: &FilterPipeline,
+    ctx: &mut HydratedContext<'_>,
+    request_filters_executed: &mut bool,
+) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+    if *request_filters_executed {
+        return Ok(None);
+    }
+    let action = execute_request(pipeline, ctx).await?;
+    let immediate = immediate_from_action(action);
+    if immediate.is_none() {
+        *request_filters_executed = true;
+    }
+    Ok(immediate)
+}
+
+/// Assemble the request response after request and selected-provider hooks finish.
+fn build_request_pipeline_responses(
+    phase: RequestPhase,
+    mutation: Option<HeaderMutation>,
+    original_len: usize,
+    end_of_stream: bool,
+    state: &mut StreamState,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let body = Some(state.request_body.as_slice());
+
     // Emit the authoritative buffer even when empty: a filter that cleared the
     // body must produce an explicit empty body AND content-length: 0. Collapsing
     // empty -> None here would drop both (buffered) or desync CL (FDS+flag).
-    let body = Some(state.request_body.as_slice());
+    if needs_delayed_selected_request_responses(phase, state) {
+        return build_delayed_selected_request_responses(mutation, end_of_stream, state);
+    }
+
     Ok(build_request_for_phase(
         phase,
         with_content_length(mutation, body, original_len),
@@ -81,6 +115,40 @@ pub(crate) async fn run_request_pipeline(
         state.protocol_config.request_body_mode,
         end_of_stream,
     ))
+}
+
+/// Whether streamed selected-provider bodies need a delayed header response.
+fn needs_delayed_selected_request_responses(phase: RequestPhase, state: &StreamState) -> bool {
+    matches!(phase, RequestPhase::Body)
+        && state.protocol_config.request_body_mode == BodyMode::Streamed
+        && state.protocol_config.send_body_without_waiting
+        && !state.header_state.request_headers_sent
+}
+
+/// Build the held header/body responses after the selected-provider hook completes.
+fn build_delayed_selected_request_responses(
+    mutation: Option<HeaderMutation>,
+    end_of_stream: bool,
+    state: &mut StreamState,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    state.header_state.request_headers_sent = true;
+    let header_mutation = merge_mutations(state.deferred_request_header_mutation.take(), mutation);
+    if state.eos_tracker.request_headers.is_complete() {
+        if !state.request_body.is_empty() {
+            return Err(Status::failed_precondition(
+                "selected-upstream body filter produced bytes after request headers ended",
+            ));
+        }
+        return Ok(vec![response::request_headers(header_mutation)]);
+    }
+    let mut responses = vec![response::request_headers(header_mutation)];
+    responses.extend(response::request_body(
+        Some(&state.request_body),
+        None,
+        state.protocol_config.request_body_mode,
+        end_of_stream,
+    ));
+    Ok(responses)
 }
 
 /// Response filter execution phase.
@@ -336,6 +404,7 @@ pub(crate) async fn process_streamed_body_chunk(
     let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
     let eos = body.end_of_stream;
     let mut chunk = body.body;
+    let original_chunk_had_bytes = !chunk.is_empty();
     let reject = if is_request {
         run_body_filters(pipeline, &mut ctx, &mut chunk, eos).await?
     } else {
@@ -359,7 +428,16 @@ pub(crate) async fn process_streamed_body_chunk(
         state.protocol_config.response_body_mode
     };
 
-    let body_data = body_data_if_present(&chunk);
+    // In streamed mode an empty body mutation is meaningful: a response filter
+    // may suppress an upstream chunk while buffering a bounded JSON document.
+    // Collapsing that result to `None` tells Envoy to forward the original
+    // chunk, which leaks the untranslated provider bytes before the final
+    // translated body is emitted.
+    let body_data = if original_chunk_had_bytes && chunk.is_empty() {
+        Some(chunk.as_slice())
+    } else {
+        body_data_if_present(&chunk)
+    };
     let responses = if is_request {
         response::request_body(body_data, None, body_mode, eos)
     } else {
@@ -479,6 +557,7 @@ pub(crate) async fn run_request_header_filters_early(
     if let Some(imm) = immediate_from_action(action) {
         return Ok(vec![response::immediate(imm)]);
     }
+    state.header_state.request_filters_executed = true;
 
     let mutation = adapter::collect_request_header_mutations(&ctx);
     ctx.dehydrate(&mut state.carried_context)?;
@@ -577,7 +656,13 @@ async fn run_request_body_filters_at_eos(
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
     match phase {
         RequestPhase::Headers => Ok(None),
-        RequestPhase::Body => run_body_filters(pipeline, ctx, request_body, true).await,
+        RequestPhase::Body => {
+            let rejection = run_body_filters(pipeline, ctx, request_body, true).await?;
+            if rejection.is_some() {
+                return Ok(rejection);
+            }
+            run_selected_upstream_body_filters(pipeline, ctx, request_body).await
+        },
     }
 }
 
@@ -602,6 +687,27 @@ async fn run_body_filters(
         *body_buf = b.to_vec();
     }
 
+    Ok(immediate_from_action(action))
+}
+
+/// Run selected-upstream body filters after request headers have selected a logical provider.
+async fn run_selected_upstream_body_filters(
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'_>,
+    body_buf: &mut Vec<u8>,
+) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+    if !pipeline.body_capabilities().needs_selected_upstream_request_body {
+        return Ok(None);
+    }
+
+    let mut body = Some(Bytes::from(mem::take(body_buf)));
+    let action = pipeline
+        .execute_http_selected_upstream_request_body(ctx, &mut body)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    if let Some(bytes) = body {
+        *body_buf = bytes.to_vec();
+    }
     Ok(immediate_from_action(action))
 }
 
@@ -984,6 +1090,147 @@ mod tests {
         }
     }
 
+    /// Suppresses streamed provider chunks until its final translated chunk.
+    struct StreamedResponseReplacementFilter;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for StreamedResponseReplacementFilter {
+        fn name(&self) -> &'static str {
+            "streamed_response_replacement"
+        }
+
+        fn response_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        fn on_response_body(
+            &self,
+            _: &mut HttpFilterContext<'_>,
+            body: &mut Option<Bytes>,
+            end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            *body = Some(if end_of_stream {
+                Bytes::from_static(b"translated-json")
+            } else {
+                Bytes::new()
+            });
+            Ok(FilterAction::Continue)
+        }
+    }
+
+    impl StreamedResponseReplacementFilter {
+        /// Registry factory for streamed response replacement tests.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    /// Rewrites a body using metadata selected in the ExtProc request-header phase.
+    struct SelectedBodyRewriteFilter;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for SelectedBodyRewriteFilter {
+        fn name(&self) -> &'static str {
+            "selected_body_rewrite"
+        }
+
+        async fn on_request(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            let provider = if ctx.get_metadata("selected.provider").is_some() {
+                "provider-called-twice"
+            } else {
+                "provider-a"
+            };
+            ctx.set_metadata("selected.provider", provider);
+            Ok(FilterAction::Continue)
+        }
+
+        fn selected_upstream_request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        fn request_body_mode(&self) -> praxis_filter::BodyMode {
+            praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1024) }
+        }
+
+        async fn on_selected_upstream_request_body(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+            body: &mut Option<Bytes>,
+        ) -> Result<praxis_filter::SelectedUpstreamBodyOutcome, praxis_filter::FilterError> {
+            let selected = ctx.get_metadata("selected.provider").unwrap_or("missing");
+            let bytes = body.as_ref().map_or(&[][..], Bytes::as_ref);
+            let rewritten = format!("{}|{selected}", String::from_utf8_lossy(bytes));
+            *body = Some(Bytes::from(rewritten));
+            Ok(praxis_filter::SelectedUpstreamBodyOutcome::Continue)
+        }
+    }
+
+    impl SelectedBodyRewriteFilter {
+        /// Registry factory for the selected-upstream body-phase test.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    /// Rejects from the selected-upstream body phase, after request selection.
+    struct SelectedBodyRejectFilter;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for SelectedBodyRejectFilter {
+        fn name(&self) -> &'static str {
+            "selected_body_reject"
+        }
+
+        async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        fn selected_upstream_request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        fn request_body_mode(&self) -> praxis_filter::BodyMode {
+            praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1024) }
+        }
+
+        async fn on_selected_upstream_request_body(
+            &self,
+            _: &mut HttpFilterContext<'_>,
+            _: &mut Option<Bytes>,
+        ) -> Result<praxis_filter::SelectedUpstreamBodyOutcome, praxis_filter::FilterError> {
+            Ok(praxis_filter::SelectedUpstreamBodyOutcome::Reject(
+                praxis_filter::Rejection::status(422).with_body(b"selected body rejected".to_vec()),
+            ))
+        }
+    }
+
+    impl SelectedBodyRejectFilter {
+        /// Registry factory for the selected-upstream rejection test.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
     /// Filter that emits body bytes at end of stream.
     struct TrailingByteFilter;
     #[async_trait::async_trait]
@@ -1082,6 +1329,355 @@ mod tests {
             1,
             "a body-filter reject must record the immediate-response metric like the header paths"
         );
+    }
+
+    /// ExtProc must run selected-upstream body filters after header filters have bound a provider.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn selected_upstream_body_filter_runs_after_request_header_selection() {
+        let pipeline = single_filter_pipeline("selected_body_rewrite", SelectedBodyRewriteFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.request_body = b"request".to_vec();
+
+        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state, false)
+            .await
+            .expect("request headers should select the provider");
+        run_request_pipeline(RequestPhase::Body, &pipeline, &mut state, true)
+            .await
+            .expect("selected-upstream body phase should run");
+
+        assert_eq!(
+            state.request_body, b"request|provider-a",
+            "selected provider metadata must reach the body rewrite"
+        );
+    }
+
+    /// Selected-upstream hook rejection follows the same immediate-response path as body-hook rejection.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    #[expect(clippy::panic, reason = "tests")]
+    async fn selected_upstream_body_filter_rejection_short_circuits() {
+        let pipeline = single_filter_pipeline("selected_body_reject", SelectedBodyRejectFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.request_body = b"request".to_vec();
+
+        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state, false)
+            .await
+            .expect("request headers should complete before selected-upstream body handling");
+        let responses = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state, true)
+            .await
+            .expect("selected-upstream rejection should be returned as an immediate response");
+
+        assert_eq!(responses.len(), 1, "rejection yields exactly one response");
+        assert!(
+            responses.first().is_some_and(response::is_immediate),
+            "selected-upstream rejection must not become a gRPC processing failure"
+        );
+        let Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ImmediateResponse(
+            immediate,
+        )) = responses.first().and_then(|response| response.response.as_ref())
+        else {
+            panic!("selected-upstream rejection must be an ExtProc ImmediateResponse");
+        };
+        assert_eq!(immediate.status.as_ref().map(|status| status.code), Some(422));
+        assert_eq!(immediate.body, "selected body rejected");
+    }
+
+    /// Header EOS is a bodyless request and must still run selected-upstream validation.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    #[expect(clippy::panic, reason = "tests")]
+    async fn selected_upstream_body_filter_rejection_runs_for_bodyless_request() {
+        let pipeline = single_filter_pipeline("selected_body_reject", SelectedBodyRejectFilter::from_config);
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+        state.protocol_config.send_body_without_waiting = true;
+
+        let responses = crate::handlers::handle_request_headers(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders {
+                end_of_stream: true,
+                ..Default::default()
+            },
+            &mut state,
+        )
+        .await
+        .expect("bodyless selected-upstream rejection should be an immediate response");
+
+        assert_eq!(responses.len(), 1, "rejection yields exactly one response");
+        let Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ImmediateResponse(
+            immediate,
+        )) = responses.first().and_then(|response| response.response.as_ref())
+        else {
+            panic!("bodyless selected-upstream rejection must be an ExtProc ImmediateResponse");
+        };
+        assert_eq!(immediate.status.as_ref().map(|status| status.code), Some(422));
+        assert_eq!(immediate.body, "selected body rejected");
+    }
+
+    fn emitted_request_body(response: &ProcessingResponse) -> Option<&[u8]> {
+        use praxis_proto::envoy::service::ext_proc::v3::{
+            body_mutation::Mutation, processing_response::Response as ProcessingResponsePayload,
+        };
+
+        let ProcessingResponsePayload::RequestBody(body) = response.response.as_ref()? else {
+            return None;
+        };
+        let mutation = body.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()?;
+        match mutation {
+            Mutation::Body(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    fn emitted_response_body(response: &ProcessingResponse) -> Option<&[u8]> {
+        use praxis_proto::envoy::service::ext_proc::v3::{
+            body_mutation::Mutation, processing_response::Response as ProcessingResponsePayload,
+        };
+
+        let ProcessingResponsePayload::ResponseBody(body) = response.response.as_ref()? else {
+            return None;
+        };
+        let mutation = body.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()?;
+        match mutation {
+            Mutation::Body(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// Empty streamed replacements must suppress raw provider chunks at Envoy.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test exercises both sides of a streamed JSON replacement"
+    )]
+    async fn streamed_response_filter_emits_empty_mutation_before_translation() {
+        use praxis_proto::envoy::service::ext_proc::v3::HttpBody;
+
+        let pipeline = single_filter_pipeline(
+            "streamed_response_replacement",
+            StreamedResponseReplacementFilter::from_config,
+        );
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+        state.protocol_config.response_body_mode = BodyMode::Streamed;
+
+        let suppressed = process_streamed_body_chunk(
+            &pipeline,
+            HttpBody {
+                body: b"raw-provider-json-part".to_vec(),
+                end_of_stream: false,
+            },
+            &mut state,
+            false,
+        )
+        .await
+        .expect("the first response chunk should be filtered");
+        assert_eq!(suppressed.first().and_then(emitted_response_body), Some(&[][..]));
+
+        let translated = process_streamed_body_chunk(
+            &pipeline,
+            HttpBody {
+                body: b"raw-provider-json-tail".to_vec(),
+                end_of_stream: true,
+            },
+            &mut state,
+            false,
+        )
+        .await
+        .expect("the final response chunk should contain only translated JSON");
+        assert_eq!(
+            translated.first().and_then(emitted_response_body),
+            Some(&b"translated-json"[..])
+        );
+    }
+
+    /// Streamed `ExternalModel` requests must stay inside ExtProc until the
+    /// selected-provider body hook finishes, then answer the deferred header
+    /// and every body message in protocol order.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test checks deferred ordering across several Envoy chunks"
+    )]
+    async fn streamed_selected_upstream_body_is_buffered_and_released_in_order() {
+        use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response as ProcessingResponsePayload;
+
+        let pipeline = single_filter_pipeline("selected_body_rewrite", SelectedBodyRewriteFilter::from_config);
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+        state.protocol_config.send_body_without_waiting = true;
+        state.max_body_accumulation = Some(64);
+
+        let header_responses = crate::handlers::handle_request_headers(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+            &mut state,
+        )
+        .await
+        .expect("header selection should run while its response remains deferred");
+        assert!(
+            header_responses.is_empty(),
+            "Envoy must not route before body translation completes"
+        );
+        assert!(state.header_state.request_filters_executed);
+        assert!(!state.header_state.request_headers_sent);
+
+        let first = crate::handlers::handle_request_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: b"requ".to_vec(),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .expect("the first streamed chunk should remain buffered in ExtProc");
+        assert!(
+            first.is_empty(),
+            "body responses remain ordered behind the pending header response"
+        );
+
+        let completed = crate::handlers::handle_request_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: b"est".to_vec(),
+                end_of_stream: true,
+            },
+            &mut state,
+        )
+        .await
+        .expect("the selected body hook should release a complete translated request");
+        assert_eq!(
+            completed.len(),
+            3,
+            "one header and two body messages need three responses"
+        );
+        assert!(matches!(
+            completed.first().and_then(|item| item.response.as_ref()),
+            Some(ProcessingResponsePayload::RequestHeaders(_))
+        ));
+        let first_body = completed.get(1).expect("the first held body response must exist");
+        let final_body = completed.get(2).expect("the translated body response must exist");
+        assert_eq!(emitted_request_body(first_body), Some(&[][..]));
+        assert_eq!(emitted_request_body(final_body), Some(&b"request|provider-a"[..]));
+        assert_eq!(state.request_body, b"request|provider-a");
+        assert!(state.header_state.request_headers_sent);
+        assert_eq!(state.pending_selected_request_body_messages, 0);
+    }
+
+    /// A selected-provider rejection supersedes the delayed header and body
+    /// responses instead of forwarding a partially buffered request upstream.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test checks deferred rejection before any request-body release"
+    )]
+    #[expect(clippy::panic, reason = "tests assert the selected rejection response shape")]
+    async fn streamed_selected_upstream_rejection_short_circuits_before_route_release() {
+        let pipeline = single_filter_pipeline("selected_body_reject", SelectedBodyRejectFilter::from_config);
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+        state.protocol_config.send_body_without_waiting = true;
+        state.max_body_accumulation = Some(64);
+
+        let headers = crate::handlers::handle_request_headers(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+            &mut state,
+        )
+        .await
+        .expect("selected-upstream headers should be evaluated");
+        assert!(headers.is_empty());
+
+        let response = crate::handlers::handle_request_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: b"request".to_vec(),
+                end_of_stream: true,
+            },
+            &mut state,
+        )
+        .await
+        .expect("selected-upstream rejection is an immediate response");
+        assert_eq!(response.len(), 1);
+        assert!(response.first().is_some_and(response::is_immediate));
+        let Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ImmediateResponse(
+            immediate,
+        )) = response.first().and_then(|item| item.response.as_ref())
+        else {
+            panic!("selected-upstream rejection must be an ExtProc ImmediateResponse");
+        };
+        assert_eq!(immediate.status.as_ref().map(|status| status.code), Some(422));
+        assert_eq!(immediate.body, "selected body rejected");
+        assert!(!state.header_state.request_headers_sent);
+    }
+
+    /// Trailer-closed streamed requests release the translated body before the
+    /// trailer acknowledgement and preserve one response per held body message.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test verifies body flush and trailer acknowledgement order"
+    )]
+    async fn streamed_selected_upstream_body_flushes_before_request_trailers() {
+        use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response as ProcessingResponsePayload;
+
+        let pipeline = single_filter_pipeline("selected_body_rewrite", SelectedBodyRewriteFilter::from_config);
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+        state.protocol_config.send_body_without_waiting = true;
+        state.max_body_accumulation = Some(64);
+
+        let headers = crate::handlers::handle_request_headers(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+            &mut state,
+        )
+        .await
+        .expect("selected-upstream headers should be deferred");
+        assert!(headers.is_empty());
+        for body in [b"re".as_slice(), b"quest".as_slice()] {
+            let responses = crate::handlers::handle_request_body(
+                &pipeline,
+                praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                    body: body.to_vec(),
+                    end_of_stream: false,
+                },
+                &mut state,
+            )
+            .await
+            .expect("streamed body chunk should stay buffered until trailers");
+            assert!(responses.is_empty());
+        }
+
+        let completed = crate::handlers::handle_trailers(&pipeline, &mut state, true)
+            .await
+            .expect("trailers should release the selected body and acknowledge trailers");
+        assert_eq!(
+            completed.len(),
+            4,
+            "header, two body messages and trailers need four responses"
+        );
+        assert!(matches!(
+            completed.first().and_then(|item| item.response.as_ref()),
+            Some(ProcessingResponsePayload::RequestHeaders(_))
+        ));
+        let first_body = completed.get(1).expect("the first held body response must exist");
+        let final_body = completed.get(2).expect("the translated body response must exist");
+        assert_eq!(emitted_request_body(first_body), Some(&[][..]));
+        assert_eq!(emitted_request_body(final_body), Some(&b"request|provider-a"[..]));
+        assert!(matches!(
+            completed.last().and_then(|item| item.response.as_ref()),
+            Some(ProcessingResponsePayload::RequestTrailers(_))
+        ));
     }
 
     /// A reject from a response-body filter must short-circuit too.
