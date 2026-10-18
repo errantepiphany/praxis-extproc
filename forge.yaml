@@ -100,6 +100,11 @@ spec:
           namespace: istio-system
           condition: available
           timeout: "120s"
+        - type: wait
+          resource: deployment/payload-processing-streaming
+          namespace: istio-system
+          condition: available
+          timeout: "120s"
 
     gateway:
       description: Gateway, HTTPRoutes, EnvoyFilter, and model backends
@@ -126,4 +131,14 @@ spec:
           resource: gateway/e2e-gateway
           namespace: istio-system
           condition: Programmed
+          timeout: "120s"
+        - type: wait
+          resource: gateway/e2e-streaming-gateway
+          namespace: istio-system
+          condition: Programmed
+          timeout: "120s"
+        - type: wait
+          resource: httproute/e2e-streaming-route
+          namespace: istio-system
+          condition: Accepted
           timeout: "120s"
