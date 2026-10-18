@@ -24,8 +24,9 @@ use crate::{
     adapter, metrics,
     pipeline::{
         MutationDelivery, RequestPhase, ResponsePhase, deferred_header_response, direction_label,
-        flush_streamed_body_filters, passthrough_chunk, process_streamed_body_chunk, run_request_header_filters_early,
-        run_request_pipeline, run_response_header_filters_early, run_response_pipeline,
+        flush_streamed_body_filters, passthrough_chunk, process_streamed_body_chunk,
+        run_bodyless_selected_upstream_pipeline, run_request_header_filters_early, run_request_pipeline,
+        run_response_header_filters_early, run_response_pipeline,
     },
     protocol::{PhaseState, ProtocolPhase, duplicate_after_eos, request_type_label},
     response::{self, BodyMode},
@@ -164,6 +165,14 @@ pub(crate) async fn handle_request_headers(
         return Err(duplicate_after_eos(ProtocolPhase::RequestHeaders));
     }
 
+    if state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed
+        && pipeline.body_capabilities().needs_selected_upstream_request_body
+    {
+        return Ok(vec![request_processing_rejection(
+            b"selected-upstream request-body processing is not supported in FULL_DUPLEX_STREAMED mode",
+        )]);
+    }
+
     let envoy_headers = extract_header_list(&headers);
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
 
@@ -179,12 +188,11 @@ async fn handle_end_stream_request_headers(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    let phase = if pipeline.body_capabilities().needs_selected_upstream_request_body {
-        RequestPhase::Body
+    if pipeline.body_capabilities().needs_selected_upstream_request_body {
+        run_bodyless_selected_upstream_pipeline(pipeline, state).await
     } else {
-        RequestPhase::Headers
-    };
-    run_request_pipeline(phase, pipeline, state, true).await
+        run_request_pipeline(RequestPhase::Headers, pipeline, state, true).await
+    }
 }
 
 /// Handle a request header message followed by one or more body messages.
@@ -314,7 +322,13 @@ fn complete_delayed_selected_request(
     state: &mut StreamState,
 ) -> Vec<ProcessingResponse> {
     let body_messages = std::mem::take(&mut state.pending_selected_request_body_messages);
-    if body_messages <= 1 || responses.first().is_some_and(response::is_immediate) {
+    if responses.first().is_some_and(response::is_immediate) {
+        return responses;
+    }
+    if body_messages == 0 {
+        return complete_selected_request_without_body_message(responses, state);
+    }
+    if body_messages == 1 {
         return responses;
     }
 
@@ -338,6 +352,25 @@ fn complete_delayed_selected_request(
     }
     completed.push(final_body);
     completed
+}
+
+/// Drop the unmatched body response, or reject translated bytes with no message to carry them.
+fn complete_selected_request_without_body_message(
+    responses: Vec<ProcessingResponse>,
+    state: &StreamState,
+) -> Vec<ProcessingResponse> {
+    if !state.request_body.is_empty() {
+        return vec![request_processing_rejection(
+            b"selected-upstream request-body filter produced bytes without an Envoy body message",
+        )];
+    }
+    responses.into_iter().filter(|item| !response::is_body(item)).collect()
+}
+
+/// Build a fail-closed local response for an unsupported request-processing path.
+fn request_processing_rejection(body: &'static [u8]) -> ProcessingResponse {
+    let rejection = praxis_filter::Rejection::status(500).with_body(body.to_vec());
+    response::immediate(adapter::rejection_to_immediate(&rejection))
 }
 
 /// Accumulate request body chunks, run full pipeline on EOS.
@@ -510,10 +543,12 @@ async fn finalize_body_on_trailers(
                 Ok(responses)
             }
         },
-        BodyMode::FullDuplexStreamed if needs_body => run_trailing_fds_body(pipeline, state, is_request).await,
+        BodyMode::FullDuplexStreamed if needs_body => {
+            Box::pin(run_trailing_fds_body(pipeline, state, is_request)).await
+        },
         BodyMode::FullDuplexStreamed => Ok(flush_deferred_fds_headers(state, is_request)),
         BodyMode::Buffered => {
-            let responses = run_trailing_body_pipeline(pipeline, state, is_request).await?;
+            let responses = Box::pin(run_trailing_body_pipeline(pipeline, state, is_request)).await?;
             Ok(rejection_only(responses, is_request))
         },
         _ => Ok(Vec::new()),
