@@ -27,6 +27,95 @@ data:
     filter_chains:
       - name: ai-filters
         filters:
+          # Regression coverage for the maas-headers-guard port
+          # (opendatahub-io/praxis-extproc#160): mirror the `ipp` chain's
+          # leading guard filter from ../../../base/config/configmap.yaml
+          # here too, so e2e exercises the real filter config and catches
+          # drift between the two copies. Canary filters right after each
+          # one surface survival of a stripped header as a response header,
+          # since the e2e backends don't otherwise expose what they received.
+          - filter: headers
+            conditions:
+              - unless:
+                  path_prefix: /maas-api
+              - unless:
+                  path_prefix: /v1/models
+              - unless:
+                  path_prefix: /v1/subscriptions
+              - unless:
+                  path_prefix: /v1/api-keys
+              - unless:
+                  path: /v1/me
+            request_remove:
+              - x-origin-cluster
+              - x-maas-username
+              - x-maas-username-oc
+              - x-maas-username-token
+              - x-maas-group
+              - x-maas-group-oc
+              - x-maas-group-token
+              - x-maas-keyname
+              - x-maas-key-id
+              - x-maas-subscription
+              - x-maas-subscription-rate-limit-id
+              - x-maas-cost-center
+              - x-maas-organization-id
+              - x-maas-identity
+              - x-maas-admin-scope
+              - x-maas-tenant
+              - x-maas-invocation-mode
+              - x-maas-policy-revision
+              - x-maas-responses-owner
+              - x-maas-return-all-models
+              - x-maas-model
+          # authorization / x-api-key removal is split into its own filter,
+          # additionally gated on X-Gateway-Model-Name == granite-8b (set by
+          # ipp-pre's BBR json_body extraction before this chain runs, from
+          # the request body's "model" field). This chain is shared --
+          # ext_proc attaches at the Gateway listener, not per-route -- with
+          # the pre-existing gpt-4 tests that route to the real external
+          # llm-katan backend over this same /v1/chat/completions path.
+          # fixtures::http_client()'s default Authorization header is
+          # llm-katan's own required credential, not a stand-in caller
+          # token, and the guard can't otherwise distinguish those requests
+          # by path alone. Scoping to granite-8b (used only by internal-model
+          # tests, which don't validate credentials) keeps this strip from
+          # ever reaching gpt-4/llm-katan traffic.
+          - filter: headers
+            conditions:
+              - unless:
+                  path_prefix: /maas-api
+              - unless:
+                  path_prefix: /v1/models
+              - unless:
+                  path_prefix: /v1/subscriptions
+              - unless:
+                  path_prefix: /v1/api-keys
+              - unless:
+                  path: /v1/me
+              - when:
+                  headers:
+                    X-Gateway-Model-Name: granite-8b
+            request_remove:
+              - authorization
+              - x-api-key
+          - filter: headers
+            conditions:
+              - when:
+                  headers_present: ["x-maas-username"]
+            response_add:
+              - name: X-Guard-Leaked-X-Maas-Username
+                value: "true"
+          - filter: headers
+            conditions:
+              - when:
+                  headers_present: ["authorization"]
+              - when:
+                  headers:
+                    X-Gateway-Model-Name: granite-8b
+            response_add:
+              - name: X-Guard-Leaked-Authorization
+                value: "true"
           # Request + response phases both evaluate against the mock NeMo service;
           # a "passed" verdict forwards traffic unchanged, so the rest of the
           # e2e suite is undisturbed.

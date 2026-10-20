@@ -147,3 +147,22 @@ spec:
         - name: internal-model
           namespace: llm
           port: 8080
+    # maas-api exemption probe: exercises the maas-headers-guard's `unless
+    # path_prefix: /maas-api` condition (opendatahub-io/praxis-extproc#160).
+    # ext-proc sees the pre-rewrite path, same as the production
+    # maas-api-route HTTPRoute's equivalent /maas-api/v1 rule, so the guard
+    # must skip stripping here.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /maas-api/v1
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /v1
+      backendRefs:
+        - name: internal-model
+          namespace: llm
+          port: 8080
