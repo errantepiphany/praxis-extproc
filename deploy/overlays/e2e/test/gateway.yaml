@@ -166,3 +166,28 @@ spec:
         - name: internal-model
           namespace: llm
           port: 8080
+    # authorization/x-api-key strip probe: a dedicated path (not a model
+    # name) for the maas-headers-guard's credential removal
+    # (opendatahub-io/praxis-extproc#160). Envoy's ext_proc runs the
+    # headers phase for every HTTP filter in the chain before the body
+    # phase for any of them, so a condition in this chain can never
+    # observe X-Gateway-Model-Name -- it's set by ipp-pre's json_body
+    # filter from the request body, which only resolves during ipp-pre's
+    # body phase, strictly after every filter's (including this chain's)
+    # headers phase already ran. Only the router, which runs after every
+    # filter's body phase, reliably sees it. Path-based gating has no such
+    # ordering dependency.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /direct/auth-guard/v1
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /v1
+      backendRefs:
+        - name: internal-model
+          namespace: llm
+          port: 8080

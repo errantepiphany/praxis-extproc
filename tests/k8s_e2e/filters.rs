@@ -17,13 +17,7 @@ async fn praxis_version_header_applied() {
 }
 
 /// Send a chat completion to `path` carrying an `X-Maas-Username` header,
-/// on top of `http_client()`'s default `Authorization` header. Always uses
-/// model `granite-8b` (routed in-cluster): the e2e guard's
-/// authorization/x-api-key removal is deliberately scoped to that model so
-/// it can never reach the pre-existing `gpt-4` tests, which route to the
-/// real external llm-katan backend and need their `Authorization` header
-/// intact to authenticate there (see
-/// deploy/overlays/e2e/workload/configmap-patch.yaml).
+/// on top of `http_client()`'s default `Authorization` header.
 async fn completion_with_identity_headers(path: &str) -> reqwest::Response {
     let client = http_client();
     let url = format!("{}{path}", gateway_url());
@@ -44,10 +38,19 @@ async fn completion_with_identity_headers(path: &str) -> reqwest::Response {
 /// `ai-filters` chain mirrors the `ipp` chain's guard filter, which must
 /// strip `authorization` and `x-maas-*` headers from inference requests
 /// before they reach the upstream model.
+///
+/// Uses the dedicated `/direct/auth-guard` path rather than the shared
+/// `/v1/chat/completions` path: the latter also carries the pre-existing
+/// `gpt-4` tests, which route to the real external llm-katan backend and
+/// need their `Authorization` header (`fixtures::http_client()`'s default)
+/// intact to authenticate there. See
+/// deploy/overlays/e2e/workload/configmap-patch.yaml for why the guard's
+/// `authorization`/`x-api-key` removal is scoped to this path instead of
+/// (as first tried) a model-name header condition.
 #[tokio::test]
 async fn maas_headers_guard_strips_on_inference_path() {
     ensure_gateway_ready().await;
-    let resp = completion_with_identity_headers("/v1/chat/completions").await;
+    let resp = completion_with_identity_headers("/direct/auth-guard/v1/chat/completions").await;
 
     assert_eq!(resp.status(), 200);
     assert!(
