@@ -27,13 +27,15 @@ data:
     filter_chains:
       - name: ai-filters
         filters:
-          # Regression coverage for the maas-headers-guard port
-          # (opendatahub-io/praxis-extproc#160): mirror the `ipp` chain's
-          # leading guard filter from ../../../base/config/configmap.yaml
-          # here too, so e2e exercises the real filter config and catches
-          # drift between the two copies. Canary filters right after each
-          # one surface survival of a stripped header as a response header,
-          # since the e2e backends don't otherwise expose what they received.
+          # Mirrors the `ipp` chain's guard filter
+          # (../../../base/config/configmap.yaml) for maas-headers-guard
+          # regression coverage. Two e2e-only additions: a `when
+          # path_prefix: /direct/internal` condition, so the strip never
+          # hits gpt-4/llm-katan's shared /v1/chat/completions (which needs
+          # its real Authorization header); and an unconditional
+          # response_add marker so tests can observe this filter's own
+          # conditions matching -- see tests/k8s_e2e/filters.rs for why a
+          # later-filter canary can't do that instead.
           - filter: headers
             conditions:
               - unless:
@@ -46,7 +48,11 @@ data:
                   path_prefix: /v1/api-keys
               - unless:
                   path: /v1/me
+              - when:
+                  path_prefix: /direct/internal
             request_remove:
+              - authorization
+              - x-api-key
               - x-origin-cluster
               - x-maas-username
               - x-maas-username-oc
@@ -68,57 +74,8 @@ data:
               - x-maas-responses-owner
               - x-maas-return-all-models
               - x-maas-model
-          # authorization / x-api-key removal is split into its own filter,
-          # additionally gated on the dedicated /direct/auth-guard path
-          # (deploy/overlays/e2e/test/gateway.yaml). This chain is shared --
-          # ext_proc attaches at the Gateway listener, not per-route -- with
-          # the pre-existing gpt-4 tests that route to the real external
-          # llm-katan backend over /v1/chat/completions, and
-          # fixtures::http_client()'s default Authorization header is
-          # llm-katan's own required credential, not a stand-in caller
-          # token. Gating on X-Gateway-Model-Name instead was tried and
-          # reverted: Envoy's ext_proc runs the headers phase for every
-          # HTTP filter in the chain before the body phase for any of
-          # them, so this filter can never observe that header -- it's
-          # set by ipp-pre's json_body filter from the request body, which
-          # only resolves during ipp-pre's body phase, strictly after
-          # every filter's (including this chain's) headers phase already
-          # ran. Only the router, which runs after every filter's body
-          # phase, reliably sees it. A dedicated path has no such
-          # ordering dependency and keeps this strip off the gpt-4/
-          # llm-katan path.
-          - filter: headers
-            conditions:
-              - unless:
-                  path_prefix: /maas-api
-              - unless:
-                  path_prefix: /v1/models
-              - unless:
-                  path_prefix: /v1/subscriptions
-              - unless:
-                  path_prefix: /v1/api-keys
-              - unless:
-                  path: /v1/me
-              - when:
-                  path_prefix: /direct/auth-guard
-            request_remove:
-              - authorization
-              - x-api-key
-          - filter: headers
-            conditions:
-              - when:
-                  headers_present: ["x-maas-username"]
             response_add:
-              - name: X-Guard-Leaked-X-Maas-Username
-                value: "true"
-          - filter: headers
-            conditions:
-              - when:
-                  headers_present: ["authorization"]
-              - when:
-                  path_prefix: /direct/auth-guard
-            response_add:
-              - name: X-Guard-Leaked-Authorization
+              - name: X-Guard-Applied
                 value: "true"
           # Request + response phases both evaluate against the mock NeMo service;
           # a "passed" verdict forwards traffic unchanged, so the rest of the

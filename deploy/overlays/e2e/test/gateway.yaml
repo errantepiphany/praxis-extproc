@@ -147,40 +147,12 @@ spec:
         - name: internal-model
           namespace: llm
           port: 8080
-    # maas-api exemption probe: exercises the maas-headers-guard's `unless
-    # path_prefix: /maas-api` condition (opendatahub-io/praxis-extproc#160).
-    # ext-proc sees the pre-rewrite path, same as the production
-    # maas-api-route HTTPRoute's equivalent /maas-api/v1 rule, so the guard
-    # must skip stripping here.
+    # maas-api exemption probe for the maas-headers-guard: same
+    # path shape as production's maas-api-route /maas-api/v1 rule.
     - matches:
         - path:
             type: PathPrefix
             value: /maas-api/v1
-      filters:
-        - type: URLRewrite
-          urlRewrite:
-            path:
-              type: ReplacePrefixMatch
-              replacePrefixMatch: /v1
-      backendRefs:
-        - name: internal-model
-          namespace: llm
-          port: 8080
-    # authorization/x-api-key strip probe: a dedicated path (not a model
-    # name) for the maas-headers-guard's credential removal
-    # (opendatahub-io/praxis-extproc#160). Envoy's ext_proc runs the
-    # headers phase for every HTTP filter in the chain before the body
-    # phase for any of them, so a condition in this chain can never
-    # observe X-Gateway-Model-Name -- it's set by ipp-pre's json_body
-    # filter from the request body, which only resolves during ipp-pre's
-    # body phase, strictly after every filter's (including this chain's)
-    # headers phase already ran. Only the router, which runs after every
-    # filter's body phase, reliably sees it. Path-based gating has no such
-    # ordering dependency.
-    - matches:
-        - path:
-            type: PathPrefix
-            value: /direct/auth-guard/v1
       filters:
         - type: URLRewrite
           urlRewrite:
