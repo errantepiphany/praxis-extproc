@@ -28,12 +28,6 @@ pub(crate) struct ProtocolConfig {
 
     /// Response body processing mode.
     pub(crate) response_body_mode: BodyMode,
-
-    /// Whether Envoy sends streamed body messages before receiving the request
-    /// header response. This lets a selected-upstream filter validate and
-    /// transform a bounded request body before Envoy commits the selected route.
-    /// It only applies to `STREAMED`; ignored for other modes.
-    pub(crate) send_body_without_waiting: bool,
 }
 
 impl TryFrom<ProtocolConfiguration> for ProtocolConfig {
@@ -45,7 +39,6 @@ impl TryFrom<ProtocolConfiguration> for ProtocolConfig {
                 .map_err(|e| format!("request_body_mode: {e}"))?,
             response_body_mode: BodyMode::try_from(proto_cfg.response_body_mode)
                 .map_err(|e| format!("response_body_mode: {e}"))?,
-            send_body_without_waiting: proto_cfg.send_body_without_waiting_for_header_response,
         })
     }
 }

@@ -401,6 +401,9 @@ impl BodyReceiptTracker {
 #[must_use = "parked cross-phase state must be hydrated into a context"]
 #[derive(Debug, Default)]
 pub(super) struct CarriedContext {
+    /// Logical cluster selected during request headers, before Envoy routes.
+    pub(super) cluster: Option<Arc<str>>,
+
     /// Branch re-entrance counters.
     pub(super) branch_iterations: HashMap<Arc<str>, u32>,
 
@@ -436,6 +439,7 @@ impl<'a> HydratedContext<'a> {
         let carried =
             carried.ok_or_else(|| Status::internal("cross-phase context missing: a prior phase did not restore it"))?;
         ctx.branch_iterations = carried.branch_iterations;
+        ctx.cluster = carried.cluster;
         ctx.executed_filter_indices = carried.executed_filter_indices;
         ctx.filter_metadata = carried.filter_metadata;
         ctx.filter_state = carried.filter_state;
@@ -461,6 +465,7 @@ impl<'a> HydratedContext<'a> {
             ));
         }
         *slot = Some(CarriedContext {
+            cluster: self.ctx.cluster,
             branch_iterations: self.ctx.branch_iterations,
             executed_filter_indices: self.ctx.executed_filter_indices,
             filter_metadata: self.ctx.filter_metadata,
@@ -529,9 +534,9 @@ pub(crate) struct StreamState {
     /// Effective body-accumulation ceiling in bytes; `None` means unbounded.
     pub(crate) max_body_accumulation: Option<usize>,
 
-    /// Number of streamed request-body messages held while selected-provider
-    /// request-body filters wait for the complete bounded body.
-    pub(crate) pending_selected_request_body_messages: usize,
+    /// BUFFERED sends one complete body message even when trailers, rather
+    /// than that message, end the request. Track that it was already filtered.
+    pub(crate) buffered_request_body_processed: bool,
 
     /// Whether to derive the client address from `x-forwarded-for` when Envoy's
     /// trusted `x-envoy-external-address` header is absent.
@@ -557,7 +562,7 @@ impl Default for StreamState {
             deferred_response_header_mutation: None,
             phase_order: PhaseOrderTracker::default(),
             max_body_accumulation: None,
-            pending_selected_request_body_messages: 0,
+            buffered_request_body_processed: false,
             trust_forwarded_for: false,
         }
     }

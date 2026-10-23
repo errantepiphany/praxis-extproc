@@ -6,11 +6,9 @@
 //! Each handler owns one protocol phase (request/response headers and body):
 //! it marks end-of-stream, converts Envoy messages into filter inputs, and
 //! routes to the [`crate::pipeline`] by body mode and filter capabilities.
-//! Buffered bodies and selected-provider request bodies are accumulated here up
-//! to the stream's effective body-accumulation limit and run through the full
-//! pipeline at EOS. Envoy queues streamed chunks until their ExtProc responses
-//! arrive, so the selected-provider ceiling must also respect the pipeline's
-//! request-body limit.
+//! Buffered bodies are accumulated up to the stream's effective body limit.
+//! Selected-upstream body filters require Envoy's BUFFERED request mode so
+//! translation finishes before the body response is sent.
 
 use praxis_filter::FilterPipeline;
 use praxis_proto::envoy::service::{
@@ -32,9 +30,6 @@ use crate::{
     response::{self, BodyMode},
     server::StreamState,
 };
-
-/// Limits deferred Envoy replies even when the client sends tiny body chunks.
-pub(crate) const MAX_PENDING_SELECTED_BODY_MESSAGES: usize = 4096;
 
 // -----------------------------------------------------------------------------
 // Local Replies
@@ -168,6 +163,13 @@ pub(crate) async fn handle_request_headers(
         return Err(duplicate_after_eos(ProtocolPhase::RequestHeaders));
     }
 
+    let envoy_headers = extract_header_list(&headers);
+    state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
+
+    if headers.end_of_stream {
+        return handle_end_stream_request_headers(pipeline, state).await;
+    }
+
     if state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed
         && pipeline.body_capabilities().needs_selected_upstream_request_body
     {
@@ -175,13 +177,6 @@ pub(crate) async fn handle_request_headers(
         return Ok(vec![request_processing_rejection(
             b"selected-upstream request-body processing is not supported in FULL_DUPLEX_STREAMED mode",
         )]);
-    }
-
-    let envoy_headers = extract_header_list(&headers);
-    state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
-
-    if headers.end_of_stream {
-        return handle_end_stream_request_headers(pipeline, state).await;
     }
 
     handle_request_headers_with_body(pipeline, state).await
@@ -200,14 +195,21 @@ async fn handle_end_stream_request_headers(
 }
 
 /// Handle a request header message followed by one or more body messages.
+#[expect(
+    clippy::too_many_lines,
+    reason = "body mode cases and selected-route guard belong together"
+)]
 async fn handle_request_headers_with_body(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    if state.protocol_config.request_body_mode == BodyMode::Streamed
-        && pipeline.body_capabilities().needs_selected_upstream_request_body
+    if has_selected_body_filter(pipeline)
+        && matches!(
+            state.protocol_config.request_body_mode,
+            BodyMode::None | BodyMode::Streamed
+        )
     {
-        return defer_selected_request_headers(pipeline, state).await;
+        return handle_unsupported_selected_request_headers(pipeline, state).await;
     }
 
     match state.protocol_config.request_body_mode {
@@ -233,29 +235,45 @@ async fn handle_request_headers_with_body(
     }
 }
 
-/// Acknowledge request headers when the selected mode defers body processing.
+/// Whether a chain contains a selected-upstream request-body participant.
+fn has_selected_body_filter(pipeline: &FilterPipeline) -> bool {
+    pipeline.body_capabilities().needs_selected_upstream_request_body
+}
+
+/// Acknowledge request headers when body processing is handled later.
 fn request_headers_without_body_filter(state: &mut StreamState) -> Vec<ProcessingResponse> {
     state.header_state.request_headers_sent = true;
     vec![response::request_headers(None)]
 }
 
-/// Hold selected-provider route mutations until the complete request body is checked.
-async fn defer_selected_request_headers(
+/// Reject a selected route in NONE or STREAMED mode; pass unselected routes through.
+async fn handle_unsupported_selected_request_headers(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    if !state.protocol_config.send_body_without_waiting {
-        warn!("selected-upstream request-body hook requires send_body_without_waiting_for_header_response");
-        return Ok(vec![request_processing_rejection(
-            b"selected-upstream request-body processing in STREAMED mode requires send_body_without_waiting_for_header_response",
-        )]);
-    }
-    Box::pin(run_request_header_filters_early(
+    let responses = Box::pin(run_request_header_filters_early(
         pipeline,
         state,
         MutationDelivery::DeferSilent,
     ))
-    .await
+    .await?;
+    if responses.first().is_some_and(response::is_immediate) {
+        return Ok(responses);
+    }
+    if state
+        .carried_context
+        .as_ref()
+        .is_some_and(|context| context.cluster.is_some())
+    {
+        warn!("selected-upstream request-body hook requires BUFFERED mode");
+        return Ok(vec![request_processing_rejection(
+            b"selected-upstream request-body processing requires BUFFERED mode",
+        )]);
+    }
+    state.header_state.request_headers_sent = true;
+    Ok(vec![response::request_headers(
+        state.deferred_request_header_mutation.take(),
+    )])
 }
 
 /// Handle request body: route by body mode and filter capabilities.
@@ -278,10 +296,6 @@ pub(crate) async fn handle_request_body(
         return Ok(response);
     }
 
-    if mode == BodyMode::Streamed && pipeline.body_capabilities().needs_selected_upstream_request_body {
-        return Box::pin(accumulate_streamed_selected_request_body(pipeline, body, state)).await;
-    }
-
     let needs_body = pipeline.body_capabilities().needs_request_body;
 
     match (mode, needs_body) {
@@ -289,89 +303,6 @@ pub(crate) async fn handle_request_body(
         (BodyMode::Streamed, true) => process_streamed_body_chunk(pipeline, body, state, true).await,
         _ => accumulate_request_body(pipeline, body, state).await,
     }
-}
-
-/// Hold selected-provider request bytes inside this ExtProc stream until the
-/// complete body is available. Envoy keeps each streamed chunk queued until
-/// its response arrives and stops reading above its buffer limit, so use the
-/// smaller of the pipeline and server limits. The request headers stay pending,
-/// so a rejected body never reaches the provider route.
-async fn accumulate_streamed_selected_request_body(
-    pipeline: &FilterPipeline,
-    body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
-    state: &mut StreamState,
-) -> Result<Vec<ProcessingResponse>, Status> {
-    let ceiling = pipeline.selected_upstream_request_body_limit();
-    let ceiling = Some(state.max_body_accumulation.map_or(ceiling, |max| max.min(ceiling)));
-    check_body_limit(state.request_body.len(), body.body.len(), ceiling)?;
-    if state.pending_selected_request_body_messages >= MAX_PENDING_SELECTED_BODY_MESSAGES {
-        metrics::record_body_size_rejection();
-        return Err(Status::resource_exhausted("too many request body messages"));
-    }
-    state.request_body.extend_from_slice(&body.body);
-    state.pending_selected_request_body_messages += 1;
-
-    if !body.end_of_stream {
-        // The ExtProc response for this body message is held until the header
-        // decision and all body messages can be answered in their original
-        // order after translation completes.
-        return Ok(Vec::new());
-    }
-
-    let responses = run_request_pipeline(RequestPhase::Body, pipeline, state, true).await?;
-    Ok(complete_delayed_selected_request(responses, state))
-}
-
-/// Match the deferred request header and all streamed body messages with
-/// ExtProc responses, keeping Envoy's request/response phase ordering intact.
-fn complete_delayed_selected_request(
-    mut responses: Vec<ProcessingResponse>,
-    state: &mut StreamState,
-) -> Vec<ProcessingResponse> {
-    let body_messages = std::mem::take(&mut state.pending_selected_request_body_messages);
-    if responses.first().is_some_and(response::is_immediate) {
-        return responses;
-    }
-    if body_messages == 0 {
-        return complete_selected_request_without_body_message(responses, state);
-    }
-    if body_messages == 1 {
-        return responses;
-    }
-
-    let header_first = responses.first().is_some_and(|item| {
-        matches!(
-            item.response,
-            Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::RequestHeaders(_))
-        )
-    });
-    if !header_first {
-        // A failed or malformed pipeline result must not be reshaped into a
-        // sequence that Envoy could associate with the wrong request phase.
-        return responses;
-    }
-    let Some(final_body) = responses.pop() else {
-        return responses;
-    };
-    let mut completed = responses;
-    for _ in 1..body_messages {
-        completed.extend(response::request_body(Some(&[]), None, BodyMode::Streamed, false));
-    }
-    completed.push(final_body);
-    completed
-}
-
-/// Drop the unmatched body response, or reject translated bytes with no message to carry them.
-fn complete_selected_request_without_body_message(
-    responses: Vec<ProcessingResponse>,
-    state: &StreamState,
-) -> Vec<ProcessingResponse> {
-    if !state.request_body.is_empty() {
-        return vec![request_processing_rejection(
-            b"selected-upstream request-body filter produced bytes without an Envoy body message",
-        )];
-    }
-    responses.into_iter().filter(|item| !response::is_body(item)).collect()
 }
 
 /// Build a fail-closed local response for an unsupported request-processing path.
@@ -386,14 +317,21 @@ async fn accumulate_request_body(
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    check_body_limit(state.request_body.len(), body.body.len(), state.max_body_accumulation)?;
+    if let Err(error) = check_body_limit(state.request_body.len(), body.body.len(), state.max_body_accumulation) {
+        if pipeline.body_capabilities().needs_selected_upstream_request_body {
+            let rejection = praxis_filter::Rejection::status(413)
+                .with_body(b"request body exceeds the selected-upstream limit".to_vec());
+            return Ok(vec![response::immediate(adapter::rejection_to_immediate(&rejection))]);
+        }
+        return Err(error);
+    }
     state.request_body.extend_from_slice(&body.body);
 
-    if !body.end_of_stream {
+    if !body.end_of_stream && state.protocol_config.request_body_mode != BodyMode::Buffered {
         return Ok(Vec::new());
     }
-
-    run_request_pipeline(RequestPhase::Body, pipeline, state, true).await
+    state.buffered_request_body_processed = state.protocol_config.request_body_mode == BodyMode::Buffered;
+    run_request_pipeline(RequestPhase::Body, pipeline, state, body.end_of_stream).await
 }
 
 // -----------------------------------------------------------------------------
@@ -538,23 +476,15 @@ async fn finalize_body_on_trailers(
     state.eos_tracker.mark_complete(phase);
 
     match mode {
-        BodyMode::Streamed if needs_body => {
-            let responses = if is_request && pipeline.body_capabilities().needs_selected_upstream_request_body {
-                Box::pin(run_trailing_body_pipeline(pipeline, state, true)).await?
-            } else {
-                Box::pin(flush_streamed_body_filters(pipeline, state, is_request)).await?
-            };
-            if is_request && pipeline.body_capabilities().needs_selected_upstream_request_body {
-                Ok(complete_delayed_selected_request(responses, state))
-            } else {
-                Ok(responses)
-            }
-        },
+        BodyMode::Streamed if needs_body => Box::pin(flush_streamed_body_filters(pipeline, state, is_request)).await,
         BodyMode::FullDuplexStreamed if needs_body => {
             Box::pin(run_trailing_fds_body(pipeline, state, is_request)).await
         },
         BodyMode::FullDuplexStreamed => Ok(flush_deferred_fds_headers(state, is_request)),
         BodyMode::Buffered => {
+            if is_request && state.buffered_request_body_processed {
+                return Ok(Vec::new());
+            }
             let responses = Box::pin(run_trailing_body_pipeline(pipeline, state, is_request)).await?;
             Ok(rejection_only(responses, is_request))
         },
@@ -756,6 +686,7 @@ mod tests {
             .expect("empty test pipeline");
         let mut state = StreamState::new();
         state.max_body_accumulation = Some(4);
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
 
         let exact = accumulate_request_body(
             &pipeline,
