@@ -1935,6 +1935,54 @@ mod tests {
         assert!(!state.header_state.request_headers_sent);
     }
 
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test checks both sides of the message-count limit"
+    )]
+    async fn streamed_selected_upstream_rejects_excess_body_messages_before_accumulation() {
+        let pipeline = single_filter_pipeline("selected_body_rewrite", SelectedBodyRewriteFilter::from_config);
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+        state.protocol_config.send_body_without_waiting = true;
+        state.pending_selected_request_body_messages = crate::handlers::MAX_PENDING_SELECTED_BODY_MESSAGES - 1;
+
+        let accepted = crate::handlers::handle_request_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: b"a".to_vec(),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .expect("the final permitted body message should be held");
+        assert!(accepted.is_empty());
+        assert_eq!(
+            state.pending_selected_request_body_messages,
+            crate::handlers::MAX_PENDING_SELECTED_BODY_MESSAGES
+        );
+        assert_eq!(state.request_body, b"a");
+
+        let error = crate::handlers::handle_request_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: b"b".to_vec(),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .expect_err("an excess body message must be rejected before accumulation");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            state.pending_selected_request_body_messages,
+            crate::handlers::MAX_PENDING_SELECTED_BODY_MESSAGES
+        );
+        assert_eq!(state.request_body, b"a");
+    }
+
     /// A selected-provider rejection supersedes the delayed header and body
     /// responses instead of forwarding a partially buffered request upstream.
     #[tokio::test]

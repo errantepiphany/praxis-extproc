@@ -33,6 +33,9 @@ use crate::{
     server::StreamState,
 };
 
+/// Limits deferred Envoy replies even when the client sends tiny body chunks.
+pub(crate) const MAX_PENDING_SELECTED_BODY_MESSAGES: usize = 4096;
+
 // -----------------------------------------------------------------------------
 // Local Replies
 // -----------------------------------------------------------------------------
@@ -301,8 +304,12 @@ async fn accumulate_streamed_selected_request_body(
     let ceiling = pipeline.selected_upstream_request_body_limit();
     let ceiling = Some(state.max_body_accumulation.map_or(ceiling, |max| max.min(ceiling)));
     check_body_limit(state.request_body.len(), body.body.len(), ceiling)?;
+    if state.pending_selected_request_body_messages >= MAX_PENDING_SELECTED_BODY_MESSAGES {
+        metrics::record_body_size_rejection();
+        return Err(Status::resource_exhausted("too many request body messages"));
+    }
     state.request_body.extend_from_slice(&body.body);
-    state.pending_selected_request_body_messages = state.pending_selected_request_body_messages.saturating_add(1);
+    state.pending_selected_request_body_messages += 1;
 
     if !body.end_of_stream {
         // The ExtProc response for this body message is held until the header
