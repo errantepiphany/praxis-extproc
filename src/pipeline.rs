@@ -64,7 +64,7 @@ async fn run_request_pipeline_inner(
     phase: RequestPhase,
     pipeline: &FilterPipeline,
     state: &mut StreamState,
-    end_of_stream: bool,
+    eos: bool,
     run_ordinary_body_filters: bool,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
@@ -80,16 +80,16 @@ async fn run_request_pipeline_inner(
         return Ok(vec![response::immediate(immediate)]);
     }
 
-    let original_len = state.request_body.len();
-    let body_reject = run_request_body_filters_at_eos(
+    let prior_len = state.request_body.len();
+    if let Some(imm) = run_request_body_filters_at_eos(
         phase,
         pipeline,
         &mut ctx,
         &mut state.request_body,
         run_ordinary_body_filters,
     )
-    .await?;
-    if let Some(imm) = body_reject {
+    .await?
+    {
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -97,7 +97,7 @@ async fn run_request_pipeline_inner(
 
     ctx.dehydrate(&mut state.carried_context)?;
 
-    build_request_pipeline_responses(phase, mutation, original_len, end_of_stream, state)
+    Ok(build_request(phase, mutation, prior_len, eos, state))
 }
 
 /// Execute request-header filters once while preserving saved route/profile metadata.
@@ -118,17 +118,17 @@ async fn execute_request_filters_if_needed(
 }
 
 /// Assemble the request response after request and selected-provider hooks finish.
-fn build_request_pipeline_responses(
+fn build_request(
     phase: RequestPhase,
     mutation: Option<HeaderMutation>,
     original_len: usize,
     end_of_stream: bool,
     state: &mut StreamState,
-) -> Result<Vec<ProcessingResponse>, Status> {
+) -> Vec<ProcessingResponse> {
     let body = Some(state.request_body.as_slice());
 
     if matches!(phase, RequestPhase::Body) && state.eos_tracker.request_headers.is_complete() {
-        return Ok(build_bodyless_selected_request_response(mutation, original_len, state));
+        return build_bodyless_selected_request_response(mutation, original_len, state);
     }
 
     // Emit the authoritative buffer even when empty: a filter that cleared the
@@ -138,13 +138,13 @@ fn build_request_pipeline_responses(
         return build_delayed_selected_request_responses(mutation, end_of_stream, state);
     }
 
-    Ok(build_request_for_phase(
+    build_request_for_phase(
         phase,
         with_content_length(mutation, body, original_len),
         body,
         state.protocol_config.request_body_mode,
         end_of_stream,
-    ))
+    )
 }
 
 /// Build the sole headers response or reject bytes that have no body message to carry them.
@@ -176,17 +176,9 @@ fn build_delayed_selected_request_responses(
     mutation: Option<HeaderMutation>,
     end_of_stream: bool,
     state: &mut StreamState,
-) -> Result<Vec<ProcessingResponse>, Status> {
+) -> Vec<ProcessingResponse> {
     state.header_state.request_headers_sent = true;
     let header_mutation = merge_mutations(state.deferred_request_header_mutation.take(), mutation);
-    if state.eos_tracker.request_headers.is_complete() {
-        if !state.request_body.is_empty() {
-            return Err(Status::failed_precondition(
-                "selected-upstream body filter produced bytes after request headers ended",
-            ));
-        }
-        return Ok(vec![response::request_headers(header_mutation)]);
-    }
     let mut responses = vec![response::request_headers(header_mutation)];
     responses.extend(response::request_body(
         Some(&state.request_body),
@@ -194,7 +186,7 @@ fn build_delayed_selected_request_responses(
         state.protocol_config.request_body_mode,
         end_of_stream,
     ));
-    Ok(responses)
+    responses
 }
 
 /// Response filter execution phase.
