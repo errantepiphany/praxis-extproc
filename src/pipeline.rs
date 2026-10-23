@@ -1185,6 +1185,47 @@ mod tests {
         }
     }
 
+    /// Suppresses one streamed request chunk before forwarding a later replacement.
+    struct StreamedRequestReplacementFilter;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for StreamedRequestReplacementFilter {
+        fn name(&self) -> &'static str {
+            "streamed_request_replacement"
+        }
+
+        fn request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_request_body(
+            &self,
+            _: &mut HttpFilterContext<'_>,
+            body: &mut Option<Bytes>,
+            end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            *body = Some(if end_of_stream {
+                Bytes::from_static(b"replacement")
+            } else {
+                Bytes::new()
+            });
+            Ok(FilterAction::Continue)
+        }
+    }
+
+    impl StreamedRequestReplacementFilter {
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
     /// Rewrites a body using metadata selected in the ExtProc request-header phase.
     struct SelectedBodyRewriteFilter;
 
@@ -1633,6 +1674,28 @@ mod tests {
         assert!(immediate.body.contains("FULL_DUPLEX_STREAMED"));
     }
 
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn streamed_selected_upstream_without_early_body_delivery_rejects_locally() {
+        use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response as ResponsePayload;
+
+        let pipeline = single_filter_pipeline("selected_body_rewrite", SelectedBodyRewriteFilter::from_config);
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+        let responses = crate::handlers::handle_request_headers(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+            &mut state,
+        )
+        .await
+        .expect("missing early body delivery should produce a local reply");
+        assert!(matches!(
+            responses.first().and_then(|item| item.response.as_ref()),
+            Some(ResponsePayload::ImmediateResponse(_))
+        ));
+        assert!(!state.header_state.request_headers_sent);
+    }
+
     fn emitted_request_body(response: &ProcessingResponse) -> Option<&[u8]> {
         use praxis_proto::envoy::service::ext_proc::v3::{
             body_mutation::Mutation, processing_response::Response as ProcessingResponsePayload,
@@ -1712,6 +1775,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    #[expect(clippy::too_many_lines, reason = "the test checks both streamed request mutations")]
+    async fn streamed_request_filter_emits_empty_mutation_before_replacement() {
+        use praxis_proto::envoy::service::ext_proc::v3::HttpBody;
+
+        let pipeline = single_filter_pipeline(
+            "streamed_request_replacement",
+            StreamedRequestReplacementFilter::from_config,
+        );
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+
+        let suppressed = process_streamed_body_chunk(
+            &pipeline,
+            HttpBody {
+                body: b"original".to_vec(),
+                end_of_stream: false,
+            },
+            &mut state,
+            true,
+        )
+        .await
+        .expect("the first request chunk should be suppressed");
+        assert_eq!(suppressed.first().and_then(emitted_request_body), Some(&[][..]));
+
+        let replaced = process_streamed_body_chunk(
+            &pipeline,
+            HttpBody {
+                body: b"tail".to_vec(),
+                end_of_stream: true,
+            },
+            &mut state,
+            true,
+        )
+        .await
+        .expect("the final request chunk should be replaced");
+        assert_eq!(
+            replaced.first().and_then(emitted_request_body),
+            Some(&b"replacement"[..])
+        );
+    }
+
     /// Streamed `ExternalModel` requests must stay inside ExtProc until the
     /// selected-provider body hook finishes, then answer the deferred header
     /// and every body message in protocol order.
@@ -1785,6 +1892,55 @@ mod tests {
         assert_eq!(state.request_body, b"request|provider-a");
         assert!(state.header_state.request_headers_sent);
         assert_eq!(state.pending_selected_request_body_messages, 0);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test checks both sides of the selected-provider limit"
+    )]
+    async fn streamed_selected_upstream_rejects_at_pipeline_limit_before_final_chunk() {
+        let pipeline = single_filter_pipeline("selected_body_rewrite", SelectedBodyRewriteFilter::from_config);
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+        state.protocol_config.send_body_without_waiting = true;
+        state.max_body_accumulation = Some(2048);
+
+        let headers = crate::handlers::handle_request_headers(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+            &mut state,
+        )
+        .await
+        .expect("selected-provider headers should remain pending");
+        assert!(headers.is_empty());
+
+        let first = crate::handlers::handle_request_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: vec![b'a'; 1024],
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .expect("a chunk at the pipeline limit should be retained");
+        assert!(first.is_empty());
+
+        let error = crate::handlers::handle_request_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: vec![b'b'],
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .expect_err("the next byte must be rejected before EOS");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(state.request_body.len(), 1024);
+        assert!(!state.header_state.request_headers_sent);
     }
 
     /// A selected-provider rejection supersedes the delayed header and body

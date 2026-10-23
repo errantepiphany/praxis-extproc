@@ -28,6 +28,10 @@
 #![allow(missing_docs, reason = "test module")]
 
 use praxis_extproc::{config, server::PraxisExtProc};
+use praxis_filter::{
+    BodyAccess, BodyMode as FilterBodyMode, FilterAction, FilterError, FilterRegistry, HttpFilter, HttpFilterContext,
+    SelectedUpstreamBodyOutcome,
+};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
@@ -2286,6 +2290,124 @@ async fn streamed_multi_chunk_request_body() {
     assert_eq!(received_body, expected, "reassembled body should match input chunks");
 }
 
+struct WireSelectedBodyFilter;
+
+#[async_trait::async_trait]
+impl HttpFilter for WireSelectedBodyFilter {
+    fn name(&self) -> &'static str {
+        "wire_selected_body"
+    }
+
+    async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        Ok(FilterAction::Continue)
+    }
+
+    fn selected_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
+    fn request_body_mode(&self) -> FilterBodyMode {
+        FilterBodyMode::StreamBuffer { max_bytes: Some(1024) }
+    }
+
+    async fn on_selected_upstream_request_body(
+        &self,
+        _: &mut HttpFilterContext<'_>,
+        body: &mut Option<bytes::Bytes>,
+    ) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
+        *body = Some(bytes::Bytes::from_static(b"rewritten-on-selected-upstream"));
+        Ok(SelectedUpstreamBodyOutcome::Continue)
+    }
+}
+
+impl WireSelectedBodyFilter {
+    #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+    fn from_config(_: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Ok(Box::new(Self))
+    }
+}
+
+/// Exercise the deferred STREAMED path over a real ExtProc gRPC connection.
+#[tokio::test]
+async fn streamed_selected_body_defers_responses_until_final_chunk() {
+    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    registry
+        .register(
+            "wire_selected_body",
+            praxis_filter::http_builtin(WireSelectedBodyFilter::from_config),
+        )
+        .expect("register selected-body test filter");
+    let (mut client, _shutdown) = start_server_with_registry(SELECTED_BODY_CONFIG, registry).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut inbound = client
+        .process(ReceiverStream::new(rx))
+        .await
+        .expect("open ExtProc stream")
+        .into_inner();
+
+    let mut headers = make_request_headers("POST", "/selected", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 1, // STREAMED
+        response_body_mode: 1,
+        send_body_without_waiting_for_header_response: true,
+    });
+    tx.send(headers).await.expect("send headers");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), inbound.message())
+            .await
+            .is_err()
+    );
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"first".to_vec(),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send first body chunk");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), inbound.message())
+            .await
+            .is_err()
+    );
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"last".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send final body chunk");
+    drop(tx);
+    let responses = collect_responses(&mut inbound).await;
+    assert_eq!(
+        responses.len(),
+        3,
+        "header and two body messages need three ordered responses"
+    );
+    assert!(matches!(&responses[0].response, Some(RespVariant::RequestHeaders(_))));
+    let body_bytes = |index: usize| match &responses[index].response {
+        Some(RespVariant::RequestBody(body)) => body
+            .response
+            .as_ref()
+            .and_then(|common| common.body_mutation.as_ref())
+            .and_then(|mutation| mutation.mutation.as_ref())
+            .and_then(|mutation| match mutation {
+                body_mutation::Mutation::Body(bytes) => Some(bytes.as_slice()),
+                _ => None,
+            }),
+        _ => None,
+    };
+    assert_eq!(body_bytes(1), Some(&[][..]));
+    assert_eq!(body_bytes(2), Some(&b"rewritten-on-selected-upstream"[..]));
+}
+
 #[tokio::test]
 async fn streamed_empty_body() {
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
@@ -2746,6 +2868,13 @@ insecure_options:
   allow_unbounded_body: true
 "#;
 
+const SELECTED_BODY_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: wire_selected_body
+"#;
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
@@ -2754,8 +2883,14 @@ type ExtProcClient =
     praxis_proto::envoy::service::ext_proc::v3::external_processor_client::ExternalProcessorClient<Channel>;
 
 async fn start_server(config_yaml: &str) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
+    start_server_with_registry(config_yaml, praxis_ai_filters::build_ai_registry()).await
+}
+
+async fn start_server_with_registry(
+    config_yaml: &str,
+    registry: FilterRegistry,
+) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
     let cfg: config::ExtProcConfig = serde_yaml::from_str(config_yaml).expect("parse config");
-    let registry = praxis_ai_filters::build_ai_registry();
     let pipeline = config::build_pipeline(&cfg, &registry).expect("build pipeline");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

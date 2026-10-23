@@ -8,9 +8,9 @@
 //! routes to the [`crate::pipeline`] by body mode and filter capabilities.
 //! Buffered bodies and selected-provider request bodies are accumulated here up
 //! to the stream's effective body-accumulation limit and run through the full
-//! pipeline at EOS. Selected-provider bodies can use streamed ExtProc mode so
-//! Envoy does not buffer them against its connection watermark before the
-//! provider-specific filter enforces its own smaller limit.
+//! pipeline at EOS. Envoy queues streamed chunks until their ExtProc responses
+//! arrive, so the selected-provider ceiling must also respect the pipeline's
+//! request-body limit.
 
 use praxis_filter::FilterPipeline;
 use praxis_proto::envoy::service::{
@@ -168,6 +168,7 @@ pub(crate) async fn handle_request_headers(
     if state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed
         && pipeline.body_capabilities().needs_selected_upstream_request_body
     {
+        warn!("selected-upstream request-body hook cannot run in FULL_DUPLEX_STREAMED mode");
         return Ok(vec![request_processing_rejection(
             b"selected-upstream request-body processing is not supported in FULL_DUPLEX_STREAMED mode",
         )]);
@@ -241,9 +242,10 @@ async fn defer_selected_request_headers(
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     if !state.protocol_config.send_body_without_waiting {
-        return Err(Status::failed_precondition(
-            "selected-upstream request-body processing in STREAMED mode requires send_body_without_waiting_for_header_response",
-        ));
+        warn!("selected-upstream request-body hook requires send_body_without_waiting_for_header_response");
+        return Ok(vec![request_processing_rejection(
+            b"selected-upstream request-body processing in STREAMED mode requires send_body_without_waiting_for_header_response",
+        )]);
     }
     Box::pin(run_request_header_filters_early(
         pipeline,
@@ -287,22 +289,20 @@ pub(crate) async fn handle_request_body(
 }
 
 /// Hold selected-provider request bytes inside this ExtProc stream until the
-/// complete body is available. Envoy's streamed mode sends each body message
-/// without buffering it against the connection watermark; the server applies
-/// its configured accumulation ceiling before running the selected-upstream
-/// hook. The request headers stay pending, so an oversized body is rejected
-/// before the provider route receives those headers.
+/// complete body is available. Envoy keeps each streamed chunk queued until
+/// its response arrives and stops reading above its buffer limit, so use the
+/// smaller of the pipeline and server limits. The request headers stay pending,
+/// so a rejected body never reaches the provider route.
 async fn accumulate_streamed_selected_request_body(
     pipeline: &FilterPipeline,
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    check_body_limit(state.request_body.len(), body.body.len(), state.max_body_accumulation)?;
+    let ceiling = pipeline.selected_upstream_request_body_limit();
+    let ceiling = Some(state.max_body_accumulation.map_or(ceiling, |max| max.min(ceiling)));
+    check_body_limit(state.request_body.len(), body.body.len(), ceiling)?;
     state.request_body.extend_from_slice(&body.body);
-    state.pending_selected_request_body_messages = state
-        .pending_selected_request_body_messages
-        .checked_add(1)
-        .ok_or_else(|| Status::resource_exhausted("too many streamed request-body messages"))?;
+    state.pending_selected_request_body_messages = state.pending_selected_request_body_messages.saturating_add(1);
 
     if !body.end_of_stream {
         // The ExtProc response for this body message is held until the header
@@ -332,17 +332,17 @@ fn complete_delayed_selected_request(
         return responses;
     }
 
-    let Some(header) = responses.first().filter(|item| {
+    let header_first = responses.first().is_some_and(|item| {
         matches!(
             item.response,
             Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::RequestHeaders(_))
         )
-    }) else {
+    });
+    if !header_first {
         // A failed or malformed pipeline result must not be reshaped into a
         // sequence that Envoy could associate with the wrong request phase.
         return responses;
-    };
-    let _ = header;
+    }
     let Some(final_body) = responses.pop() else {
         return responses;
     };
